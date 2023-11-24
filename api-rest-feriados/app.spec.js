@@ -1,5 +1,5 @@
 const { app, knex } = require("./app");
-const { startDatabase, dropDatabase, databaseExists } = require("./migrate");
+const { startDatabase, dropDatabase, databaseExists } = require("./database-utils");
 
 const supertest = require("supertest");
 
