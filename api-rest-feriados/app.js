@@ -172,6 +172,49 @@ const createHolidayParamsValidationMiddleware = (req, res, next) => {
 
 const searchCache = new Map();
 
+function addCache(key, value, code, state) {
+  searchCache.set(key, value);
+
+  if (code) {
+    const oldAreaKeys = areaRelatedCacheKeys.get(code) ?? [];
+
+    areaRelatedCacheKeys.set(code, [...oldAreaKeys, key]);
+  }
+
+  if (state) {
+    const oldStateKeys = stateRelatedCacheKeys.get(state) ?? [];
+
+    stateRelatedCacheKeys.set(state, [...oldStateKeys, key]);
+  }
+
+  const SECOND = 1000;
+
+  setTimeout(() => {
+    searchCache.delete(key);
+
+    if (code) {
+      const oldAreaKeys = areaRelatedCacheKeys.get(code) ?? [];
+
+      areaRelatedCacheKeys.set(
+        code,
+        oldAreaKeys.filter((key) => key !== key)
+      );
+    }
+
+    if (state) {
+      const oldStateKeys = stateRelatedCacheKeys.get(state) ?? [];
+
+      stateRelatedCacheKeys.set(
+        state,
+        oldStateKeys.filter((key) => key !== key)
+      );
+    }
+  }, 30 * SECOND);
+}
+
+const stateRelatedCacheKeys = new Map();
+const areaRelatedCacheKeys = new Map();
+
 router.get(
   holidayResourceUrl,
   searchHolidayParamsValidationMiddleware,
@@ -180,16 +223,14 @@ router.get(
 
     const key = `${code}.${date}`;
 
-    if (searchCache.has(key)) {
-      return res.status(200).json(searchCache.get(key));
-    }
+    if (searchCache.has(key)) return res.status(200).json(searchCache.get(key));
 
     const ddMMDate = date.split("-").reverse().join("/").slice(0, 5);
 
     const fixedHoliday = fixedBrazilHolidays.get(ddMMDate);
 
     if (fixedHoliday) {
-      searchCache.set(key, { name: fixedHoliday });
+      addCache(key, { name: fixedHoliday });
 
       return res.status(200).json({ name: fixedHoliday });
     }
@@ -210,9 +251,11 @@ router.get(
 
       const name = floatingHolidays.get(floatingKey).name;
 
-      searchCache.set(key, { name });
+      const data = { name };
 
-      return res.status(200).json({ name });
+      addCache(key, data);
+
+      return res.status(200).json(data);
     }
 
     const areaHolidays = [
@@ -222,6 +265,8 @@ router.get(
 
     const areaHoliday = areaHolidays.findIndex((holiday) => holiday === date);
 
+    const state = code.substring(0, 2);
+
     if (areaHoliday !== -1) {
       const area = await knex
         .select("*")
@@ -229,21 +274,33 @@ router.get(
         .where({ code })
         .limit(1);
 
-      if (!area) return res.status(404).send();
+      if (!area[0]) return res.status(404).send();
 
-      const hasCarnaval = Boolean(area[0].carnaval);
-      const hasCorpusChristi = Boolean(area[0].corpus_christi);
+      const cityArea = area.find((area) => area.code === code);
 
-      if (areaHoliday === 0 && hasCarnaval) {
-        return res.status(200).json({ name: "Carnaval" });
-      }
+      const hasCarnaval = Boolean(cityArea.carnaval);
+      const hasCorpusChristi = Boolean(cityArea.corpus_christi);
 
-      if (areaHoliday === 1 && hasCorpusChristi) {
-        return res.status(200).json({ name: "Corpus Christi" });
+      const isCarnaval = areaHoliday === 0 && hasCarnaval;
+      const isCorpusChristi = areaHoliday === 1 && hasCorpusChristi;
+
+      const hasHoliday = isCarnaval || isCorpusChristi;
+
+      if (hasHoliday) {
+        const data = {};
+
+        data.name = isCarnaval
+          ? "Carnaval"
+          : isCorpusChristi
+          ? "Corpus Christi"
+          : undefined;
+
+        addCache(key, data, code, state);
+
+        return res.status(200).json(data);
       }
     }
 
-    const state = code.substring(0, 2);
     const queryDate = date.split("-").slice(1).join("-");
 
     const holiday = await knex
@@ -251,13 +308,27 @@ router.get(
       .from("holidays")
       .where({ code, date: queryDate })
       .orWhere({ code: state, date: queryDate })
-      .limit(1);
+      .limit(2);
 
-    if (!holiday) return res.status(404).send();
+    if (!holiday || (Array.isArray(holiday) && holiday.length === 0))
+      return res.status(404).send();
 
-    searchCache.set(key, { name: holiday[0].title });
+    const stateHoliday = holiday.find((holiday) => holiday.code === state);
+    const cityHoliday = holiday.find((holiday) => holiday.code === code);
 
-    return res.status(200).json({ name: holiday[0].title });
+    if (cityHoliday) {
+      const data = { name: cityHoliday.title };
+
+      addCache(key, data, code);
+
+      return res.status(200).json(data);
+    }
+
+    const data = { name: stateHoliday.title };
+
+    addCache(key, data, code, state);
+
+    return res.status(200).json(data);
   }
 );
 
@@ -287,15 +358,19 @@ router.put(
       return res.status(200).send();
     }
 
-    const row = await knex
-      .insert({
-        code: code,
-        date: date,
-        title: name,
-      })
-      .into("holidays");
+    try {
+      await knex
+        .insert({
+          code: code,
+          date: date,
+          title: name,
+        })
+        .into("holidays");
 
-    return res.status(201).send();
+      return res.status(201).send();
+    } catch (_e) {
+      return res.status(422).send();
+    }
   }
 );
 
@@ -313,6 +388,8 @@ router.delete(
 
     const customHolidaysRegex = /^(corpus-christi|carnaval)$/;
 
+    const isState = code.length === 2;
+
     if (customHolidaysRegex.test(date)) {
       const area = await knex
         .select("*")
@@ -322,39 +399,53 @@ router.delete(
 
       if (!area) return res.status(404).send();
 
-      const isState = code.length === 2;
-
       const key = date.replace("-", "_");
 
       await knex
         .update({ [key]: false })
         .from("areas")
         .where({ [isState ? "state" : "code"]: code });
+    } else {
+      const state = code.substring(0, 2);
 
-      return res.status(204).send();
+      const dbHolidays = await knex
+        .select("*")
+        .from("holidays")
+        .where({ code: state, date })
+        .orWhere({ code: code, date })
+        .limit(2);
+
+      const stateHoliday = dbHolidays.find((holiday) => holiday.code === state);
+      const areaHoliday = dbHolidays.find((holiday) => holiday.code === code);
+
+      if (stateHoliday && code !== state) {
+        return res.status(403).send();
+      }
+
+      if (!areaHoliday) {
+        return res.status(404).send();
+      }
+
+      await knex.delete().from("holidays").where({ code, date });
     }
 
-    const state = code.substring(0, 2);
+    if (isState) {
+      const stateKeys = stateRelatedCacheKeys.get(code) ?? [];
 
-    const dbHolidays = await knex
-      .select("*")
-      .from("holidays")
-      .where({ code: state, date })
-      .orWhere({ code: code, date })
-      .limit(2);
+      stateKeys.forEach((key) => {
+        if (searchCache.has(key)) searchCache.delete(key);
+      });
 
-    const stateHoliday = dbHolidays.find((holiday) => holiday.code === state);
-    const areaHoliday = dbHolidays.find((holiday) => holiday.code === code);
-
-    if (stateHoliday && code !== state) {
-      return res.status(403).send();
+      if (stateRelatedCacheKeys.has(code)) stateRelatedCacheKeys.delete(code);
     }
 
-    if (!areaHoliday) {
-      return res.status(404).send();
-    }
+    const areaKeys = areaRelatedCacheKeys.get(code) ?? [];
 
-    await knex.delete().from("holidays").where({ code, date });
+    areaKeys.forEach((key) => {
+      if (searchCache.has(key)) searchCache.delete(key);
+    });
+
+    if (areaRelatedCacheKeys.has(code)) areaRelatedCacheKeys.delete(code);
 
     return res.status(204).send();
   }
